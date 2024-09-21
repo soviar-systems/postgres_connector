@@ -156,6 +156,7 @@ class PostgresConnector:
             "PRIMARY",
             "FOREIGN",
             "UNIQUE",
+            #"id",
         ],  # for attributes_dict and schema.sql file
     ):
         # connection
