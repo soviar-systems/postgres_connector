@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "postgres_connector"
+version = "0.1.0"
+description = "psycopg 3 wrapper with schema-aware DDL and DML helpers for PostgreSQL projects"
+readme = "ReadMe.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "psycopg>=3.1",
+]
+
+[project.optional-dependencies]
+# pip install postgres_connector[analysis]  — enables MyQuery.get_df() / get_list()
+analysis = [
+    "pandas>=2.0",
+]
+
+[project.urls]
+Repository = "https://github.com/soviar-systems/postgres_connector"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[tool.coverage.run]
+source = ["postgres_connector"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+# Only the single-file module is shipped — no subpackages
+packages = ["postgres_connector.py"]

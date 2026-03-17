@@ -1,28 +1,94 @@
+"""
+Shared PostgreSQL access library for all projects under /projects/databases/.
+
+Design contract (ADR-001):
+  - All SQL uses psycopg's sql module (sql.Identifier, sql.Literal, sql.SQL).
+    No f-string or %-style SQL construction anywhere in this file.
+  - Schema definitions use the tuple format: {table: [(col, type), ..., (CONSTRAINT, def)]}.
+    The last entry of every table list MUST be a constraint entry (PRIMARY KEY, UNIQUE, …).
+    Use _is_constraint() to detect constraint entries — never positional slicing.
+  - Each project uses its own PostgreSQL schema (namespace). Pass schema= at instantiation.
+    All table references are schema-qualified: sql.Identifier(self.schema, table).
+  - Logging via logging.getLogger(__name__). No print() in production code.
+  - No pexpect. Dump/restore operations live in start.sh using PGPASSWORD env var.
+
+Public API:
+
+  PostgresConnector(host, port, dbname, user, password, schema="public")
+    .connect()                              → self
+    .disconnect()                           → self
+    .ensure_schema(relations, check_table)  → "created" | "empty" | "populated"
+    .create_tables(relations)               → self
+    .create_attributes_dict(relations)      → {table: [col, ...]}   (static method)
+    .drop_all_tables()                      → self
+    .row_exists(table, attributes, values)  → bool
+    .get_foreign_key(table, attrs, vals)    → int  (raises KeyError if not found)
+    .insert_into_table(table, attrs, vals)  → int  (get-or-create; returns PK)
+
+  MyQuery(query, host, port, dbname, user, password, schema="public")
+    Executes query at init; exposes .rows, .columns, .get_df(), .get_list(), .explain().
+    Requires pandas for get_df() and get_list():
+        pip install postgres_connector[analysis]
+
+  MyLogger(...)
+    Configures a RotatingFileHandler + StreamHandler logger for standalone (non-Scrapy)
+    projects. Scrapy projects do not need this — Scrapy configures logging automatically.
+
+See also:
+  psycopg3 transactions: https://www.psycopg.org/psycopg3/docs/basic/transactions.html
+  psycopg3 sql module:   https://www.psycopg.org/psycopg3/docs/api/sql.html
+"""
+
 import logging
-import re
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-import pandas as pd
-import pexpect
 import psycopg
 from psycopg import sql
 
+try:
+    import pandas as pd
+    _PANDAS_AVAILABLE = True
+except ImportError:
+    _PANDAS_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+# ── Schema-definition helpers ─────────────────────────────────────────────────
+
+_CONSTRAINT_KEYWORDS = frozenset({"PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "EXCLUDE"})
+
+
+def _is_constraint(attr: str) -> bool:
+    """
+    Return True if `attr` (the first element of a schemata tuple) is a SQL
+    constraint keyword rather than a column name.
+
+    Used by create_tables() and create_attributes_dict() to distinguish:
+      ("id",          "SERIAL")           → column      → False
+      ("PRIMARY KEY", "(id)")             → constraint  → True
+      ("UNIQUE",      "(col_a, col_b)")   → constraint  → True
+    """
+    return attr.split()[0].upper() in _CONSTRAINT_KEYWORDS
+
+
+# ── Logger helper (for standalone / non-Scrapy projects) ─────────────────────
 
 class MyLogger:
     """
-    Define a custom logger for the database project.
-    There are two possible kinds of loggers: a file logger
-      and a console logger (stdin and stderr).
-    Define a new instance before defining a new
-      postgres_connector instance.
+    Configure a Python logger with a rotating file handler and a console handler.
 
-    By default, with each start a logger creates a file
-      with the date in its name and, this log file is
-      rotated each 20 MB for 100 backups which is enough
-      to keep all the log data for small database projects.
+    Intended for standalone projects that manage their own logging (e.g. scripts,
+    notebooks). Scrapy projects do NOT need this — Scrapy configures the root logger
+    at startup and all logging.getLogger(__name__) calls in this library flow through
+    it automatically.
+
+    Usage:
+        my_log = MyLogger(log_dir="./logs", log_file="db.log", verbose=True)
+        db = PostgresConnector(..., ...)
+        # logging.getLogger("postgres_connector") now writes to ./logs/db.log
     """
 
     def __init__(
@@ -30,13 +96,13 @@ class MyLogger:
         mode: str = "a",
         log_formatter: str = "[%(asctime)s] %(levelname)s: %(message)s, line %(lineno)d, in %(name)s",
         console_formatter: str = "[%(asctime)s] %(levelname)s: %(message)s",
-        max_bytes: int = 20 * 1200 * 1200,  # 20 MB
-        rotate_number: int = 5,  # i.e. a lot :)
+        max_bytes: int = 20 * 1024 * 1024,  # 20 MB
+        rotate_number: int = 5,
         debug: bool = False,
         verbose: bool = False,
         log_dir: Optional[str] = "./",
         log_file: Optional[str] = "database.log",
-        add_date: Optional[bool] = False,  # to log_file
+        add_date: Optional[bool] = False,
     ):
         self.log_dir = log_dir
         self.log_file = log_file
@@ -48,808 +114,535 @@ class MyLogger:
         self.rotate_number = rotate_number
         self.debug = debug
         self.verbose = verbose
-        self.logger = self.setup_logging()
+        self.logger = self._setup_logging()
 
-    def setup_logging(self) -> logging.Logger:
+    def _setup_logging(self) -> logging.Logger:
         """
-        Configures logging for the database connector:
-        - a file logger for saving all logs (DEBUG by default,
-          hardcoded),
-        - a console logger for side effect watching (ERROR
-          by default, can be configured in debug and verbose
-          flags).
-        By default, console logger has its own simple
-          formatter, while the log file is much more detailed.
-        Console logger can work in debug mode (formatter is
-          the same as log file), and verbose and error
-          (default) modes (simple formatter).
-          Debug mode has precedence over verbose mode.
-        If you set log_dir OR log_file to None, only console output
-          will be set as a logger.
+        Build and return a configured logger.
 
-        Parameters are set in the __init__ method.
+        File handler (DEBUG level) is added when both log_dir and log_file are set.
+        Console handler level: DEBUG (if debug=True) > INFO (if verbose=True) > ERROR.
+        Debug mode takes precedence over verbose mode.
 
-        Returns:
-        - logging.Logger: The configured logger object.
+        Returns: logging.Logger
         """
+        _logger = logging.getLogger(__name__)
+        _logger.setLevel(logging.DEBUG)
 
-        # logger configuration
-        logger = logging.getLogger(__name__)
-        logger.setLevel(logging.DEBUG)
+        if _logger.hasHandlers():
+            _logger.handlers.clear()
 
-        if logger.hasHandlers():
-            logger.handlers.clear()
+        file_fmt = logging.Formatter(self.log_formatter)
 
-        # log file handler
-        lf = logging.Formatter(self.log_formatter)  # used in ch.setFormatter
         if self.log_dir and self.log_file:
-
-            # Create the log directory if it doesn't exist
             log_dir_path = Path(self.log_dir)
             log_dir_path.mkdir(parents=True, exist_ok=True)
 
-            # log_file name
-            log_file = self.add_date_to_log_file() if self.add_date else self.log_file
-
-            # Rotating file handler for database logs
-            log_file_path = log_dir_path / log_file
+            log_file = self._dated_filename() if self.add_date else self.log_file
             lfh = RotatingFileHandler(
-                log_file_path,
+                log_dir_path / log_file,
                 mode=self.mode,
                 maxBytes=self.max_bytes,
                 backupCount=self.rotate_number,
             )
             lfh.setLevel(logging.DEBUG)
-            lfh.setFormatter(lf)
+            lfh.setFormatter(file_fmt)
+            _logger.addHandler(lfh)
 
-            logger.addHandler(lfh)
-
-        # Console handler
-        cf = logging.Formatter(self.console_formatter)
+        console_fmt = logging.Formatter(self.console_formatter)
         ch = logging.StreamHandler()
         if self.debug:
             ch.setLevel(logging.DEBUG)
-            ch.setFormatter(lf)
+            ch.setFormatter(file_fmt)
+        elif self.verbose:
+            ch.setLevel(logging.INFO)
+            ch.setFormatter(console_fmt)
         else:
-            if self.verbose:
-                ch.setLevel(logging.INFO)
-            else:  # default
-                ch.setLevel(logging.ERROR)
-            ch.setFormatter(cf)
-        logger.addHandler(ch)
+            ch.setLevel(logging.ERROR)
+            ch.setFormatter(console_fmt)
+        _logger.addHandler(ch)
 
-        return logger
+        return _logger
 
-    def add_date_to_log_file(self) -> str:
+    def _dated_filename(self) -> str:
         """
-        Add date to log_file name
+        Insert a timestamp into the log file name.
+        E.g. "database.log" → "database.20260317_143022.log"
+        Uses %H%M%S (portable) rather than %s (Linux-only Unix timestamp).
         """
-        now = datetime.now().strftime("%Y%m%d_%s")
-        splitted_fname = self.log_file.split(".")
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        p = Path(self.log_file)
+        return f"{p.stem}.{now}{p.suffix or '.log'}"
 
-        if ".log" in self.log_file:
-            return f"{'.'.join(splitted_fname[:-1])}.{now}.{splitted_fname[-1]}"
-        else:
-            return f"{'.'.join(splitted_fname)}.{now}.log"
 
+# ── Core database connector ───────────────────────────────────────────────────
 
 class PostgresConnector:
     """
-    Class that has ready-to-use methods for updating the db.
-      Also you can implement any pg built-in command using
-      a generic method "pg_command()"
+    psycopg 3 wrapper providing schema-aware DDL and DML operations.
+
+    All methods that generate SQL use psycopg's sql module exclusively —
+    no f-string or %-style SQL. Table names are always schema-qualified
+    via sql.Identifier(self.schema, table).
+
+    Parameters:
+    - host, port, dbname, user, password: connection credentials
+    - schema: str: PostgreSQL schema (namespace) for this project's tables.
+      Default "public". Set per-project via info.py / DB_SCHEMA env var.
+      See ADR-001 §4.
     """
 
     def __init__(
         self,
-        # connection configuration
         host: str,
         port: str,
         dbname: str,
         user: str,
         password: str,
-        # logger
-        logger: logging.Logger = None,
-        # new database config
-        schemata: Optional[dict] = None,  # for a brand new database
-        filter_list: Optional[List[str]] = [
-            "PRIMARY",
-            "FOREIGN",
-            "UNIQUE",
-        ],  # for attributes_dict and schema.sql file
+        schema: str = "public",
     ):
-        # connection
         self.host = host
         self.port = port
         self.dbname = dbname
         self.user = user
         self.password = password
+        self.schema = schema
         self.connection = None
-        # new database
-        self.schemata = schemata  # to build a brand new database
-        self.filter_list = filter_list
-        self.attributes_dict = self.create_attributes_dict()
-        # logger
-        if logger is None:
-            logger = MyLogger(log_dir=None).logger
-        self.logger = logger
-        self.logger.debug("New postgres_connector instance created")
-
-    def create_attributes_dict(self) -> Optional[dict]:
-        """
-        Retrieve the attributes' names in a dictionary format.
-
-        Parameters:
-        - schemata: dict: dict with the tables' names as keys and SQL-formatted
-          attributes lists of strings for each attribute as values (see example
-          below);
-        - filter_list: list: a list with the words, like 'primary' or 'unique'
-          to filter the attribute string; notice that the method retrieves the
-          first word from the attribute string, so does it check the first
-          word in the filter list, not all the words in the string.
-
-        Example of the schemata dict:
-            ```
-            schemata = {
-                "un_resolution_title": ("id SERIAL",
-                          "name TEXT UNIQUE NOT NULL",
-                          "PRIMARY KEY (id)"),
-                "un_meeting": ("id SERIAL",
-                                   "symbol VARCHAR(64) UNIQUE NOT NULL",
-                                   "PRIMARY KEY (id)")
-            }
-            ```
-        """
-        if self.schemata is None:
-            return None
-
-        # lowercase all the words in the filter_list
-        filter_list = list(map(str.lower, self.filter_list))
-
-        # our return dictionary
-        attributes_dict = dict()
-        for table, attributes in self.schemata.items():
-            for attr in attributes:
-                attr = attr.split()[0]
-                if attr.lower() not in filter_list:
-                    attributes_dict.setdefault(table, []).append(attr)
-
-        self.logger.debug(f"self.filter_list = {self.filter_list}")
-        self.logger.debug(f"self.attributes_dict = {attributes_dict}")
-
-        return attributes_dict
-
-    def pg_command(
-        self,
-        pg_utility: str,
-        options: Optional[str] = None,
-        arguments: Optional[str] = None,
-    ) -> str:
-        """
-        Base method for executing any pg command against
-          the database. Methods of manipulating the database
-          themtselves are based on this method.
-
-        Parameters:
-        - pg_utility: str: utility like createdb, pg_dump, etc.;
-        - options: str: options of the pg_utility;
-        - arguments: str: any arguments like an SQL query.
-        """
-        # connection args
-        args = [
-            "-h",
-            self.host,
-            "-p",
-            self.port,
-            "-U",
-            self.user,
-            self.dbname,
-        ]
-        # add options
-        if options:
-            args.extend(options.split())
-        # add arguments
-        if arguments:
-            self.logger.debug(
-                f'Executing command: {pg_utility} {" ".join(args)} "{arguments}"'
-            )
-            args.append(arguments)
-        else:
-            self.logger.debug(f'Executing command: {pg_utility} {" ".join(args)}')
-
-        # command execution
-        child = pexpect.spawn(command=pg_utility, args=args, encoding="utf-8")
-        child.expect(r".*word.*", timeout=10)
-        child.sendline(self.password)
-
-        i = child.expect([r".*word.*", pexpect.EOF], timeout=10)
-        # check for second password query
-        if i == 0:
-            message = f"Incorrect password passed while executing {pg_utility} command."
-            raise AttributeError(message)
-
-        # result = child.before.decode()
-        result = child.before
-
-        # check for errors in result
-        if "error" in result.lower():
-            message = f"Unexpected error happened while executing {pg_utility} command: {result}"
-            raise RuntimeError(message)
-
-        # notify about other events
-        elif "notice" in result.lower():
-            self.logger.warning(result)
-            return 1
-
-        self.logger.debug(result)
-        return result
-
-    def drop_database(self, silent: bool = False) -> "PostgresConnector":
-        """
-        Drop entire database. All the connections are forcibly stopped.
-
-        Parameters:
-        - silent: bool: use --if-exists option to skip exception.
-        """
-
-        try:
-            options = "-e -f"
-            if silent:
-                options += " --if-exists"
-            i = self.pg_command(pg_utility="dropdb", options=options)
-
-        except Exception as e:
-            self.logger.error(f"Count not drop_database(): {e}")
-            raise e
-
-        if i != 1:
-            self.logger.info(f'Database "{self.dbname}" has been successfully dropped')
-
-        return self
-
-    def create_database(self) -> "PostgresConnector":
-        """
-        Create a new empty database with the owner of the
-          current database.
-        """
-
-        try:
-            self.pg_command(pg_utility="createdb", options="-e")
-        except Exception as e:
-            self.logger.critical(f"Could not create_database(): {e}")
-            raise e
-
-        self.logger.info(f'Database "{self.dbname}" has been successfully created')
-        return self
+        logger.debug("PostgresConnector instance created (schema=%s)", schema)
 
     def connect(self, autocommit: bool = True) -> "PostgresConnector":
+        """
+        Open a psycopg connection and store it in self.connection.
+
+        Parameters:
+        - autocommit: bool: when True each statement commits immediately.
+          Pipelines open explicit transactions via connection.transaction(),
+          which works correctly under autocommit mode — see
+          https://www.psycopg.org/psycopg3/docs/basic/transactions.html
+
+        Returns self for fluent chaining. Safe to call more than once (no-op
+        if already connected).
+        """
         if not self.connection:
             self.connection = psycopg.connect(
-                f"""
-                    host={self.host}
-                    port={self.port}
-                    dbname={self.dbname}
-                    user={self.user}
-                    password={self.password}
-                 """,
-                # autocommit does not open transactions
-                # if False - the entire connection will be one big transaction
+                f"host={self.host} port={self.port} dbname={self.dbname}"
+                f" user={self.user} password={self.password}",
                 autocommit=autocommit,
-                prepare_threshold=1,
+                prepare_threshold=2,
             )
-            self.logger.debug(
-                f'Connection to "{self.dbname}" database has been established'
-            )
+            logger.info('Connected to "%s"', self.dbname)
         else:
-            self.logger.debug(
-                f'Connection to "{self.dbname}" database is already established'
-            )
+            logger.debug('Already connected to "%s"', self.dbname)
         return self
 
     def disconnect(self) -> "PostgresConnector":
+        """
+        Close the connection and reset self.connection to None.
+
+        Returns self. Safe to call even if already disconnected.
+        """
         if self.connection:
             self.connection.close()
             self.connection = None
-            self.logger.debug(f'Connection to "{self.dbname}" database has been closed')
+            logger.info('Disconnected from "%s"', self.dbname)
         else:
-            self.logger.debug(f'No connection to "{self.dbname}" found')
-
+            logger.debug("disconnect() called but no connection was open")
         return self
 
-    def create_schema_file(self, fname: Optional[str] = None) -> Path:
+    def ensure_schema(
+        self, relations: dict, check_table: str = "resolution"
+    ) -> str:
         """
-        Creates an SQL file with schemas for creating tables.
+        Detect whether the schema and tables exist and have data.
+
+        Uses the database itself as the source of truth for first-run detection —
+        no log-file checks.
 
         Parameters:
-        - fname: str: a name for your SQL file with the
-          SQL-formatted schemata.
+        - relations: dict: schemata dict in tuple format (from schemata.py);
+          passed to create_tables() only when the schema is missing.
+        - check_table: str: table name used as the presence/population probe.
+          Defaults to "resolution"; set to the main fact table of your project.
 
-        Returns:
-        - fname: Path object.
+        Returns one of:
+        - "created":   schema/table did not exist; create_tables() was called.
+        - "empty":     table exists but has 0 rows.
+        - "populated": table exists with at least one row.
         """
-
-        if fname is None:
-            fname = f"{self.dbname}_schema.sql"
-        fname = Path(fname)
-
-        # establish connection if needed
-        _need_to_disconnect = False
-        if self.connection is None:
-            _need_to_disconnect = True
-            self.connect()
-
-        with open(fname, "w") as f:
-            # build each table's creation query
-            for table, attributes in self.schemata.items():
-                # build columns strings
-                columns = list()
-                for attr in attributes:
-                    if attr.split()[0] not in self.filter_list:
-                        columns.append(
-                            sql.SQL("{} {}").format(
-                                sql.Identifier(attr.split()[0]),
-                                sql.SQL(" ".join(attr.split()[1:])),
-                            )
-                        )
-                    else:
-                        columns.append(sql.SQL("{}").format(sql.SQL(attr)))
-
-                columns = [sql.SQL(",\n    ").join(columns)]
-                # build a query string
-                query = sql.SQL("CREATE TABLE IF NOT EXISTS {} (\n    {}\n);\n").format(
-                    sql.Identifier(table), sql.SQL(",\n").join(columns)
-                )
-                f.write(query.as_string(self.connection))
-
-        self.logger.info(f'Schema file saved as "{str(fname)}"')
-
-        if _need_to_disconnect:
-            self.disconnect()
-        return fname
-
-    def create_tables(
-        self,
-        fname: Optional[str] = None,
-        keep_file: Optional[bool] = False,
-    ) -> "PostgresConnector":
-        """
-        Creates tables in the database based on the provided schemas file.
-
-        Parameters:
-        - fname: str: the name for your SQL-formatted schemata file;
-        - verbose: bool: Flag to print verbose output
-
-        Returns:
-        - self
-        """
-
         try:
-            # create an sql schema file
-            fname = self.create_schema_file(fname)
-
-            # create tables
-            i = self.pg_command(
-                pg_utility="psql", options="-e -f", arguments=str(fname)
-            )
-
-        except Exception as e:
-            if fname:
-                fname.unlink()
-            message = f"Could not create_tables(): {e}"
-            self.logger.critical(message)
-            raise RuntimeError(message)
-
-        if i != 1:
-            tables = list(self.attributes_dict.keys())
-            self.logger.info(
-                "Tables {} have been successfully created".format(
-                    ", ".join(f'"{t}"' for t in tables)
+            count = self.connection.execute(
+                sql.SQL("SELECT COUNT(*) FROM {}").format(
+                    sql.Identifier(self.schema, check_table)
                 )
+            ).fetchone()[0]
+        except psycopg.errors.UndefinedTable:
+            logger.info(
+                "Table %s.%s not found — creating schema...", self.schema, check_table
             )
-        if not keep_file:
-            fname.unlink()
-            self.logger.debug(f"{fname} file has been removed")
+            self.create_tables(relations)
+            return "created"
 
+        if count == 0:
+            logger.info("%s.%s exists but is empty", self.schema, check_table)
+            return "empty"
+
+        logger.info("%s.%s rows: %d", self.schema, check_table, count)
+        return "populated"
+
+    def create_tables(self, relations: dict) -> "PostgresConnector":
+        """
+        Create the PostgreSQL schema (namespace) and all tables defined in `relations`.
+
+        Uses psycopg's sql module throughout:
+        - Column names → sql.Identifier(col_name)
+        - Type definitions → sql.SQL(type_def)   (internal schemata.py strings)
+        - Constraint entries → sql.SQL(keyword + " " + definition)
+        - Table names → sql.Identifier(self.schema, table)
+
+        Constraint vs column detection uses _is_constraint() — NOT positional slicing.
+
+        Parameters:
+        - relations: dict: {table_name: [(col, type), ..., (CONSTRAINT, def)]}
+          See schemata.py and ADR-001 §3 for the required format.
+
+        Returns self.
+        """
+        self.connection.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                sql.Identifier(self.schema)
+            )
+        )
+        logger.info("Schema %s ready", self.schema)
+
+        for table, attributes in relations.items():
+            parts = []
+            for attr, type_def in attributes:
+                if _is_constraint(attr):
+                    # e.g. ("PRIMARY KEY", "(id)") → PRIMARY KEY (id)
+                    # Both tokens come from internal schemata.py — sql.SQL() is safe.
+                    parts.append(sql.SQL(f"{attr} {type_def}"))
+                else:
+                    # e.g. ("name", "TEXT UNIQUE") → "name" TEXT UNIQUE
+                    parts.append(
+                        sql.SQL("{} {}").format(
+                            sql.Identifier(attr),
+                            sql.SQL(type_def),
+                        )
+                    )
+            query = sql.SQL("CREATE TABLE IF NOT EXISTS {} ({})").format(
+                sql.Identifier(self.schema, table),
+                sql.SQL(", ").join(parts),
+            )
+            self.connection.execute(query)
+            logger.debug(query.as_string(self.connection))
+
+        logger.info("All tables created in schema %s", self.schema)
         return self
 
-    def drop_all_tables(self):
+    @staticmethod
+    def create_attributes_dict(relations: dict) -> dict:
         """
-        Drops all the tables in the database.
+        Build a {table: [col_name, ...]} dict from a schemata relations dict.
+
+        Constraint entries are excluded using _is_constraint() — the first token
+        of the attribute name is checked against _CONSTRAINT_KEYWORDS.
+        Do NOT use positional slicing ([:-1]) to exclude constraints; that breaks
+        if a table ever has a column as its last entry.
+
+        Parameters:
+        - relations: dict: schemata in tuple format {table: [(col, type), ...]}
+
+        Returns: dict[str, list[str]]
         """
-        if self.connection is None:
-            message = (
-                f"Could not drop_all_tables(): self.connection is {self.connection}"
-            )
-            self.logger.critical(message)
-            raise RuntimeError(message)
-        # get the relations' names
-        query = sql.SQL(
-            """
-            SELECT table_name
-              FROM information_schema.tables
-              WHERE table_schema = 'public'
-            """
+        return {
+            table: [attr for attr, _ in attributes if not _is_constraint(attr)]
+            for table, attributes in relations.items()
+        }
+
+    def drop_all_tables(self) -> "PostgresConnector":
+        """
+        Drop all tables in self.schema with CASCADE.
+
+        Intended for development resets only — never called during normal operation.
+
+        Returns self.
+        """
+        if not self.connection:
+            raise RuntimeError("drop_all_tables() called without an open connection")
+
+        cursor = self.connection.execute(
+            sql.SQL(
+                "SELECT table_name FROM information_schema.tables"
+                " WHERE table_schema = {}"
+            ).format(sql.Literal(self.schema))
         )
-        self.logger.debug(query.as_string(self.connection))
-        cursor = self.connection.execute(query)
-        tables = [table[0] for table in cursor.fetchall()]
+        table_names = [row[0] for row in cursor.fetchall()]
 
-        # delete tables
-        if tables:
-            for table in tables:
-                query = sql.SQL(
-                    """
-                    DROP TABLE IF EXISTS {} CASCADE;
-                    """
-                ).format(sql.Identifier(table))
-                self.connection.execute(query)
-
-            self.logger.info(
-                "Tables {} have been successfully dropped".format(
-                    ", ".join([f'"{t}"' for t in tables])
+        if table_names:
+            for name in table_names:
+                self.connection.execute(
+                    sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
+                        sql.Identifier(self.schema, name)
+                    )
                 )
-            )
+            logger.info("Dropped from %s: %s", self.schema, ", ".join(table_names))
         else:
-            self.logger.info("No tables to drop found")
+            logger.info("No tables to drop in schema %s", self.schema)
 
         return self
 
-    def make_dump(self, options="-v -f", fpath="./", fname=None) -> str:
+    def row_exists(
+        self, table: str, attributes: list, values: list
+    ) -> bool:
         """
-        Make the database dump and save the file in the
-          fname path. Built-in psql command is used;
-          you are free to modify its behaviour
-        Parameters:
-        - fpath: str: where to save the dump; './' by default;
-        - fname: str: file name for dump.
+        Return True if a row matching all (attribute, value) pairs exists.
 
-        Returns:
-        - str: a path of the dump file.
-        """
-
-        if fname is None:
-            fname = f"{self.dbname}_{datetime.now().strftime('%Y%m%d_%s')}.sql"
-
-        if "/" not in fpath:
-            fpath += "/"
-        arguments = f"{fpath}{fname}"
-        self.pg_command(pg_utility="pg_dump", options=options, arguments=arguments)
-
-        self.logger.info(f'"{self.dbname}" database dump saved as {arguments}.')
-
-        return arguments
-
-    def export_schema(self, options="-s -F p -E UTF-8 -f", fpath="./", fname=None):
-        """
-        Export the schemata of the existing database for
-          creating beautiful schema image on
-          https://dbdiagram.io/d
+        Uses sql.Identifier for column names and sql.Literal for values —
+        safe for any string content and non-string types (int, date, None).
 
         Parameters:
-        - fname: str: a file name;
-        - fpath: str: a file path, default is './'.
+        - table: str: bare table name (schema applied automatically)
+        - attributes: list[str]: column names to filter on
+        - values: list: corresponding values; must be same length as attributes
 
-        Returns:
-        - fname as Path object
+        Raises ValueError if len(attributes) != len(values).
         """
-
-        if fname is None:
-            fname = f"{self.dbname}_schema.sql"
-
-        self.make_dump(options=options, fpath=fpath, fname=fname)
-        return fname
-
-    def row_exists(self, table: str, attributes: list[str], values: list[str]) -> bool:
-        """
-        Checks whether the entire row is already in the table.
-
-        Parameters:
-        - table: str: table name;
-        - attributes: list;
-        - values: list;
-
-        Returns:
-        - bool: True if the row exists
-        """
-
         if len(attributes) != len(values):
-            self.logger.error(
-                f"Number of attributes ({len(attributes)}) and values ({len(values)}) is different.\nAttributes: {attributes}\nValues: {values}\nSee row_exists() method."
+            raise ValueError(
+                f"Attribute/value count mismatch for {self.schema}.{table}: "
+                f"{len(attributes)} attrs vs {len(values)} values.\n"
+                f"attributes: {attributes}\nvalues: {values}"
             )
-            raise ValueError
 
-        query = sql.SQL("SELECT EXISTS (SELECT 1 FROM {} WHERE {})").format(
-            sql.Identifier(table),
-            sql.SQL(" AND ").join(
-                [
-                    sql.SQL("{} = {}").format(sql.Identifier(attr), sql.Literal(val))
-                    for attr, val in zip(attributes, values)
-                ]
-            ),
+        conditions = sql.SQL(" AND ").join(
+            sql.SQL("{} = {}").format(sql.Identifier(a), sql.Literal(v))
+            for a, v in zip(attributes, values)
         )
-
+        query = sql.SQL("SELECT EXISTS (SELECT 1 FROM {} WHERE {})").format(
+            sql.Identifier(self.schema, table),
+            conditions,
+        )
         result = self.connection.execute(query).fetchone()[0]
-
-        self.logger.debug(query.as_string(self.connection))
-        self.logger.info(f"Row exists: {result}")
-
+        logger.debug("%s → %s", query.as_string(self.connection), result)
         return result
 
     def get_foreign_key(
         self,
         table: str,
-        attributes: list[str],
-        values: list[any],
+        attributes: list,
+        values: list,
         id_: str = "id",
-        no_log: bool = False,
     ) -> int:
         """
-        Get the primary key of the table's tuple.
+        Fetch the primary key of the row where all (attribute, value) pairs match.
 
         Parameters:
-        - table: str
-        - attributes: list of str
-        - value: list of values of any type
-        - id_: str: name for id attribute if it differs from
-          cannonical "id"
-        - no_log: bool: set True if you want to supress
-          logging.
+        - table: str: bare table name (schema applied automatically)
+        - attributes: list[str]: column names to filter on
+        - values: list: corresponding filter values
+        - id_: str: PK column name; default "id"
 
-        Returns:
-        - id: int
+        Returns: int (PK value)
+        Raises KeyError if no matching row is found.
         """
-        if not self.row_exists(table, attributes, values):
-            if not no_log:
-                self.logger.error(
-                    f'No data found for "{table} table" while executing get_foreign_key method. Foreign key cannot be obtained'
-                )
-                self.logger.debug(f"Attributes: {attributes}, values: {values}.")
-            raise AttributeError
-
-        self.logger.info(f'Getting "{id_}" from "{table}"...')
-        query = sql.SQL("SELECT {} FROM {} WHERE {};").format(
+        query = sql.SQL("SELECT {} FROM {} WHERE {}").format(
             sql.Identifier(id_),
-            sql.Identifier(table),
+            sql.Identifier(self.schema, table),
             sql.SQL(" AND ").join(
-                [
-                    sql.SQL("{} = {}").format(sql.Identifier(attr), sql.Literal(val))
-                    for attr, val in zip(attributes, values)
-                ]
+                sql.SQL("{} = {}").format(sql.Identifier(a), sql.Literal(v))
+                for a, v in zip(attributes, values)
             ),
         )
-
-        self.logger.debug(query.as_string(self.connection))
+        logger.debug(query.as_string(self.connection))
 
         cursor = self.connection.execute(query).fetchone()
         if cursor:
-            fk = cursor[0]
-            self.logger.info(f'"{id_}" found: {fk}')
-            return fk
+            logger.debug('"%s" found in %s.%s: %s', id_, self.schema, table, cursor[0])
+            return cursor[0]
 
-        self.logger.error(
-            f'fetchone() returned "{cursor}" while getting the "{id_}" from "{table}" table while executing get_foreign_key() method'
+        raise KeyError(
+            f"No row found in {self.schema}.{table} for "
+            f"{dict(zip(attributes, values))}"
         )
-        raise KeyError
 
     def insert_into_table(
-        self, table: str, attributes: list[str], values: list[str], id_: str = "id"
+        self,
+        table: str,
+        attributes: list,
+        values: list,
+        id_: str = "id",
     ) -> int:
         """
-        Inserts data into attributes of the table and returns
-          the primary key, i.e. id.
+        Get-or-create: INSERT the row and return its PK; if a duplicate conflict
+        occurs, fetch and return the existing row's PK.
+
+        Strategy: INSERT ON CONFLICT DO NOTHING RETURNING {id_}.
+        - New row → RETURNING yields the PK; one round-trip.
+        - Existing row → RETURNING yields nothing → get_foreign_key() fetches PK;
+          two round-trips only in the conflict case, which is the minority.
 
         Parameters:
-        - table: str: Name of the table
-        - attributes: list or tuple of strings: List of attribute names
-        - values: list or tuple of strings: List of
-          corresponding values for attributes
-        - special_id: str: specify the name for id attribute
-          if it is different from cannonical "id"
+        - table: str: bare table name (schema applied automatically)
+        - attributes: list[str]: column names (must NOT include the SERIAL/PK column)
+        - values: list: corresponding values, same length as attributes
+        - id_: str: PK column name; default "id"
 
-        Returns:
-        - id of the the row, i.e. its primary key.
+        Returns: int (PK of the new or existing row)
+        Raises ValueError if len(attributes) != len(values).
         """
         if len(attributes) != len(values):
-            self.logger.error(
-                f'Number of attributes and values in "{table}" is different\nAttributes: {attributes}\nValues: {values}'
+            raise ValueError(
+                f"Attribute/value count mismatch for {self.schema}.{table}: "
+                f"{len(attributes)} attrs vs {len(values)} values.\n"
+                f"attributes: {attributes}\nvalues: {values}"
             )
-            raise ValueError
 
-        try:
-            self.logger.info(f'Trying to insert new data into "{table}" table...')
-            pk = self.get_foreign_key(table, attributes, values, id_=id_, no_log=True)
-            # self.logger.info(f'The value(s) is(are) already in the "{table}" table.')
-            return pk
-
-        except:
-            self.logger.info(f'Populating "{table}" table...')
-
-        query_string = "INSERT INTO {rel} ({cols}) VALUES ({vals}) ON CONFLICT DO NOTHING RETURNING {id_};"
-
-        query = sql.SQL(query_string).format(
-            rel=sql.Identifier(table),
+        query = sql.SQL(
+            "INSERT INTO {rel} ({cols}) VALUES ({vals})"
+            " ON CONFLICT DO NOTHING RETURNING {id_}"
+        ).format(
+            rel=sql.Identifier(self.schema, table),
             cols=sql.SQL(", ").join(map(sql.Identifier, attributes)),
             vals=sql.SQL(", ").join(map(sql.Literal, values)),
             id_=sql.Identifier(id_),
         )
-
-        self.logger.debug(query.as_string(self.connection))
+        logger.debug(query.as_string(self.connection))
 
         result = self.connection.execute(query).fetchone()
         if result:
-            self.logger.info(f'Insertion into "{table}" table is successful')
+            logger.debug('Inserted into %s.%s, %s=%s', self.schema, table, id_, result[0])
             return result[0]
 
-    def copy_csv(self, table, attributes, data, verbose=False):
-        """
-        Loads raw csv into one PostgeSQL table.
+        # Conflict: row already exists — fetch its PK
+        logger.debug('Conflict in %s.%s — fetching existing %s', self.schema, table, id_)
+        return self.get_foreign_key(table, attributes, values, id_=id_)
 
-        Parameters:
-        - table: str: name of the table to copy to
-        - attributes: list: list of attributes of the table to copy to
-        - data: object: csv reader object
-        - connection: psycopg class
-        """
 
-        cols_for_query = ", ".join(attributes)
-        query = f"COPY {table} ({cols_for_query}) FROM STDIN"
-        count = 0
-
-        if verbose:
-            print("Started copying the csv...")
-        # this way is much faster but the result is written at the end
-        for row in data:
-            copy.write_row(row)
-            count += 1
-            if count % 100_000 == 0:
-                print(f"{count} rows loaded...")
-        # if count == 100_000:
-        #     break
-
-        # this way is much much slower but it writes each row at a time
-        # for row in data:
-        #     with connection.cursor().copy(query) as copy:
-        #         copy.write_row(row)
-
-        if verbose:
-            print(f'"{table}" has been loaded into database "{self.dbname}"')
-
-        return 0
-
+# ── Interactive analysis helper ───────────────────────────────────────────────
 
 class MyQuery(PostgresConnector):
     """
-    Provide a query and get all you need for manipulations.
-    There are two primary ways of retrieving data from the db:
-    1. Using psycopg lib: you get data you can manipulate with;
-    2. Using psql: you get only side effect, use when you need
-      to execute built-in psql commands.
-    WARNING: No SQL injection protection, direct communication to the database.
+    Execute a SQL query and inspect the results interactively.
+
+    Executes `query` at instantiation time and stores rows + column names.
+    Provides explain(), get_df(), get_list() for notebook / REPL use.
+
+    get_df() and get_list() require pandas:
+        pip install postgres_connector[analysis]
+
+    Parameters: same as PostgresConnector plus:
+    - query: str: raw SQL query to execute (no parameterisation — use only in
+      trusted, interactive contexts, not in production pipelines).
     """
 
     def __init__(
         self,
-        query: Optional[str] = None,
-        logger: Optional[logging.Logger] = None,
-        host: str = info.host,
-        port: str = info.port,
-        dbname: str = info.dbname,
-        user: str = info.user,
-        password: str = info.pwd,
+        query: str,
+        host: str,
+        port: str,
+        dbname: str,
+        user: str,
+        password: str,
+        schema: str = "public",
     ):
-        """
-        init cursor and rows ready for use
-        """
-        super().__init__(logger, host, port, dbname, user, password)
+        super().__init__(host, port, dbname, user, password, schema=schema)
         self.query = query
-        # if you just want to see the credentials, like dbname, this is skipped
-        if self.query:
-            if "\\" not in self.query:
-                self.cursor = self.get_cursor()
-                self.rows = self.cursor.fetchall()
-                self.columns = [desc[0] for desc in self.get_cursor().description]
+        self.connect()
+        cursor = self.connection.execute(query)
+        self.rows = cursor.fetchall()
+        self.columns = [d[0] for d in cursor.description] if cursor.description else []
 
-    def get_cursor(self, query: Optional[str] = None) -> psycopg.cursor:
+    def execute(self, query: str) -> None:
         """
-        Get psycopg cursor, method is used in init
-        """
-        if query == None:
-            query = self.query
-        with psycopg.connect(
-            f"""
-            host={self.host}
-            port={self.port}
-            dbname={self.dbname}
-            user={self.user}
-            password={self.password}
-            """
-        ) as conn:
-            return conn.execute(query)
+        Execute a raw SQL string on the open connection and print results.
 
-    def psql(self) -> None:
+        Intended for quick ad-hoc queries in a REPL/notebook. For production
+        code use the parameterised methods on PostgresConnector directly.
         """
-        Implements psql query in terminal and prints psql view of data
+        cursor = self.connection.execute(query)
+        if cursor.description:
+            cols = [d[0] for d in cursor.description]
+            print("\t".join(cols))
+            print("-" * 60)
+            for row in cursor.fetchall():
+                print("\t".join(str(v) for v in row))
+
+    def explain(self, analyze: bool = False) -> None:
         """
-        result = self.pg_command("psql", "-c", self.query)
-        print(result)
-        # return result
-        # query = f'psql -h {self.host} -p {self.port} -U {self.user} -d {self.dbname} -c "{query}"'
-
-        # child = pexpect.spawn(query)
-        ## child.expect(r".*word*")
-        # child.expect(f".*{self.user}.*")
-        # child.sendline(self.password)
-        # child.expect(pexpect.EOF)
-
-        # print the query result
-        # print(child.before.decode())
-
-    def explain(self, command="EXPLAIN ", verbose=False):
-        """
-        Method calls the built-in pg explain method on the query
-        """
-        query = command + self.query
-        if verbose:
-            print(query)
-        cursor = self.get_cursor(query)
-
-        print("\t", cursor.description[0][0])
-        print("-" * 80)
-
-        rows = cursor.fetchall()
-        for line in rows:
-            print(line[0])
-
-    def explain_analyze(self, verbose=False):
-        """
-        Method calls the built-in pg explain and
-          analyze methods on the query
-        """
-        self.explain(command="EXPLAIN ANALYZE ", verbose=verbose)
-
-    def get_df(self, index=False):
-        """
-        Create pandas dataframe from the queried data
+        Run EXPLAIN [ANALYZE] on self.query and print the query plan.
 
         Parameters:
-        - index: bool: whether to use the first column as index;
+        - analyze: bool: if True, runs EXPLAIN ANALYZE (executes the query).
         """
-        try:
-            # Get column names
-            columns = [desc[0] for desc in self.cursor.description]
-            # print(self.cursor.description)
-        except Exception as e:
-            print("ERROR in self.get_df:", e)
-            return 1
+        prefix = "EXPLAIN ANALYZE " if analyze else "EXPLAIN "
+        cursor = self.connection.execute(prefix + self.query)
+        print("\t", cursor.description[0][0])
+        print("-" * 80)
+        for row in cursor.fetchall():
+            print(row[0])
 
-        # Create a DataFrame from the fetched rows
-        result = pd.DataFrame(self.rows, columns=columns)
-
-        if index:
-            result = result.set_index(result.iloc[:, 0])
-            result = result.drop(result.columns[0], axis=1)
-
-        return result
-
-    def get_list(self, column_name: str, sort=False, unique=False):
+    def get_df(self, index: bool = False):
         """
-        Get list of values from the given column
-        """
+        Return query results as a pandas DataFrame.
 
+        Parameters:
+        - index: bool: if True, use the first column as the DataFrame index.
+
+        Requires pandas. Raises ImportError if not installed.
+        """
+        if not _PANDAS_AVAILABLE:
+            raise ImportError(
+                "pandas is required for get_df(). "
+                "Install with: pip install postgres_connector[analysis]"
+            )
+        df = pd.DataFrame(self.rows, columns=self.columns)
+        if index and not df.empty:
+            df = df.set_index(df.columns[0])
+        return df
+
+    def get_list(
+        self, column_name: str, sort: bool = False, unique: bool = False
+    ) -> list:
+        """
+        Return a list of values from a single column of the query result.
+
+        Parameters:
+        - column_name: str: must match one of self.columns
+        - sort: bool: sort the result
+        - unique: bool: deduplicate (uses pandas .unique())
+
+        Requires pandas. Raises ImportError if not installed.
+        """
+        if not _PANDAS_AVAILABLE:
+            raise ImportError(
+                "pandas is required for get_list(). "
+                "Install with: pip install postgres_connector[analysis]"
+            )
         result = self.get_df()[column_name]
         if unique:
             result = result.unique()
-
         if sort:
             return sorted(result)
-
         return list(result)
 
 
-def view(rows=5, cols=15):
+# ── Notebook display helper ───────────────────────────────────────────────────
+
+def view(rows: int = 5, cols: int = 15) -> None:
     """
-    DataFrame rows and columns view for database queries
+    Configure pandas display options for comfortable notebook viewing.
+
+    Parameters:
+    - rows: int: max rows to display (default 5)
+    - cols: int: max columns to display (default 15)
+
+    Requires pandas. Raises ImportError if not installed.
     """
+    if not _PANDAS_AVAILABLE:
+        raise ImportError(
+            "pandas is required for view(). "
+            "Install with: pip install postgres_connector[analysis]"
+        )
     pd.set_option("display.max_rows", rows)
     pd.set_option("display.min_rows", rows)
     pd.set_option("display.max_columns", cols)

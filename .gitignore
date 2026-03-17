@@ -257,7 +257,6 @@ layers*/
 
 # My temporary files
 *~.*~
-test*
 
 # vim tmp files
 .*.swp
